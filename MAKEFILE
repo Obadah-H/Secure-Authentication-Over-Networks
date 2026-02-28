@@ -1,0 +1,25 @@
+.PHONY: setup-client setup-server run-client run-server clean
+
+setup-client:
+	cd client && go mod tidy
+
+setup-server:
+	cd server && go mod tidy
+	cd server && cp .env.example .env 2>/dev/null || true
+
+run-client:
+	cd client && go run main.go -password "123456789" -server "http://localhost:8080" -salt  "7a8f3c4d9e2b1a5f6c8d3e7a2b9f4c1d" -email "john@example.com"
+
+run-server:
+	cd server && go run main.go
+
+build-client:
+	cd client && go build -o ../bin/client main.go
+
+build-server:
+	cd server && go build -o ../bin/server main.go
+
+build-all: build-client build-server
+
+clean:
+	rm -rf bin/

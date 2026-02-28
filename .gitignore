@@ -7,6 +7,9 @@
 *.dll
 *.so
 *.dylib
+client/.idea/
+client/timing.log
+server/.idea/
 
 # Test binary, built with `go test -c`
 *.test
