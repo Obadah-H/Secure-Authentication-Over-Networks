@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/sha3"
@@ -40,6 +41,7 @@ func main() {
 	salt := flag.String("salt", "", "Salt of password")
 	serverURL := flag.String("server", "http://localhost:8080", "Server URL")
 	timeout := flag.Int("timeout", 30, "Request timeout in seconds")
+	isParallel := flag.Int("isparallel", 0, "Send requests in parallel (1) or sequentially (0)")
 
 	flag.Parse()
 
@@ -54,25 +56,61 @@ func main() {
 	hashedHash := hashKeccak256(fmt.Sprintf("%s%s", hash, *code))
 	fmt.Printf("Original string: %s\n", *password)
 	fmt.Printf("Keccak256 hash: %s\n", hash)
-	txt := ""
-
-	for i := 0; i < 100; i++ {
-		start := time.Now()
-		// Send to server
-		err := sendToServer(*serverURL, *code, hashedHash, *email, *timeout)
-		if err != nil {
-			_, err := fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			if err != nil {
-				return
-			}
-
+	if *isParallel == 1 {
+		// Prepare all requests upfront
+		url := fmt.Sprintf("%s/api/check-hash", *serverURL)
+		client := &http.Client{
+			Timeout: time.Duration(*timeout) * time.Second,
 		}
+		requests := make([]*http.Request, 1000)
+		for i := 0; i < 1000; i++ {
+			req, err := prepareRequest(url, *code, hashedHash, *email)
+			if err != nil {
+				log.Fatalf("Error preparing request %d: %v", i, err)
+			}
+			requests[i] = req
+		}
+
+		// All requests ready — start the timer and fire them all at once
+		var wg sync.WaitGroup
+		gate := make(chan struct{})
+		for i := 0; i < 1000; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				<-gate
+				err := executeRequest(client, requests[idx])
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error (request %d): %v\n", idx, err)
+				}
+			}(i)
+		}
+
+		start := time.Now()
+		close(gate) // release all goroutines at once
+		wg.Wait()
+
 		elapsed := time.Since(start).Microseconds()
-		txt += fmt.Sprintf("%d\n", elapsed)
-	}
-	err := os.WriteFile("timing.log", []byte(txt), 0644)
-	if err != nil {
-		log.Fatal(err)
+		txt := fmt.Sprintf("%d\n", elapsed)
+		err := os.WriteFile("timing2.log", []byte(txt), 0644)
+		if err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		txt := ""
+		for i := 0; i < 1000; i++ {
+			start := time.Now()
+			err := sendToServer(*serverURL, *code, hashedHash, *email, *timeout)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			}
+			elapsed := time.Since(start).Microseconds()
+			txt += fmt.Sprintf("%d\n", elapsed)
+		}
+		err := os.WriteFile("timing.log", []byte(txt), 0644)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	os.Exit(1)
@@ -85,9 +123,8 @@ func hashKeccak256(input string) string {
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
-// sendToServer sends the hash to the server and processes the response
-func sendToServer(serverURL, code string, hash string, email string, timeout int) error {
-	// Prepare the request body
+// prepareRequest builds an HTTP request ready to be sent
+func prepareRequest(url, code, hash, email string) (*http.Request, error) {
 	requestBody := RequestBody{
 		Code:          code,
 		Hash:          hash,
@@ -95,60 +132,51 @@ func sendToServer(serverURL, code string, hash string, email string, timeout int
 		HashAlgorithm: "keccak256",
 	}
 
-	// Marshal to JSON
 	jsonBody, err := json.Marshal(requestBody)
 	if err != nil {
-		return fmt.Errorf("error marshaling JSON: %w", err)
+		return nil, fmt.Errorf("error marshaling JSON: %w", err)
 	}
 
-	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: time.Duration(timeout) * time.Second,
-	}
-
-	// Create request
-	url := fmt.Sprintf("%s/api/check-hash", serverURL)
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
 	if err != nil {
-		return fmt.Errorf("error creating request: %w", err)
+		return nil, fmt.Errorf("error creating request: %w", err)
 	}
 
-	// Set headers
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "Keccak256-Client/1.0")
 
-	// Send request
-	fmt.Printf("Sending hash to server: %s\n", url)
+	return req, nil
+}
+
+// executeRequest sends a prepared request and processes the response
+func executeRequest(client *http.Client, req *http.Request) error {
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("error sending request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Read response
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("error reading response: %w", err)
 	}
 
-	// Parse response
 	var serverResp ServerResponse
 	if err := json.Unmarshal(body, &serverResp); err != nil {
 		return fmt.Errorf("error parsing server response: %w\nRaw response: %s", err, string(body))
 	}
 
-	// Display results
 	fmt.Println("\n=== Server Response ===")
 	fmt.Printf("Success: %v\n", serverResp.Success)
 	fmt.Printf("Message: %s\n", serverResp.Message)
 
 	if serverResp.UserFound {
-		fmt.Println("✅ User found in database!")
+		fmt.Println("User found in database!")
 		if serverResp.UserData != nil {
 			fmt.Printf("User data: %+v\n", serverResp.UserData)
 		}
 	} else {
-		fmt.Println("❌ No user found with this hash")
+		fmt.Println("No user found with this hash")
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -156,4 +184,19 @@ func sendToServer(serverURL, code string, hash string, email string, timeout int
 	}
 
 	return nil
+}
+
+// sendToServer sends the hash to the server and processes the response
+func sendToServer(serverURL, code string, hash string, email string, timeout int) error {
+	client := &http.Client{
+		Timeout: time.Duration(timeout) * time.Second,
+	}
+
+	url := fmt.Sprintf("%s/api/check-hash", serverURL)
+	req, err := prepareRequest(url, code, hash, email)
+	if err != nil {
+		return err
+	}
+
+	return executeRequest(client, req)
 }
